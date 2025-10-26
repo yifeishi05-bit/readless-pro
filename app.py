@@ -18,17 +18,9 @@ if code != REAL_CODE:
     st.markdown(f"💳 [Click here to subscribe ReadLess Pro]({BUY_LINK})")
     st.stop()
 
-# --- OpenRouter 免费API配置 ---
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY") or st.secrets.get("OPENROUTER_API_KEY", "")
-
-headers = {
-    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-    "Content-Type": "application/json"
-}
-
 # --- 页面主体 ---
-st.title("📘 ReadLess Pro – AI Reading Assistant (Free OpenRouter Version)")
-st.subheader("Upload PDFs or text to get instant AI summaries for free!")
+st.title("📘 ReadLess Pro – 100% Free AI Reading Assistant")
+st.subheader("Upload PDFs or text to get instant AI summaries (no API key required)")
 
 uploaded_file = st.file_uploader("📄 Upload a PDF file", type="pdf")
 
@@ -42,24 +34,16 @@ if uploaded_file:
 
     st.info("✅ PDF uploaded successfully! Generating summary...")
 
-    # --- 发送请求到 OpenRouter ---
-    data = {
-        "model": "mistralai/mixtral-8x7b-instruct",  # ✅ 免费稳定模型
-        "messages": [
-            {"role": "system", "content": "You are a professional summarizer. Output in English or Chinese automatically."},
-            {"role": "user", "content": f"Summarize this document clearly and concisely:\n\n{text[:10000]}"}  # 限制长度避免超时
-        ]
-    }
-
+    # --- 免费 summarizer API（huggingface 免费接口） ---
     try:
         response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=data
+            "https://api-inference.huggingface.co/models/facebook/bart-large-cnn",
+            headers={"Authorization": "Bearer hf_yOUR_FREE_TOKEN_IF_YOU_HAVE_ONE"},
+            json={"inputs": text[:3000]}  # 限制长度避免 Hugging Face 免费接口超时
         )
 
         if response.status_code == 200:
-            summary = response.json()["choices"][0]["message"]["content"]
+            summary = response.json()[0]["summary_text"]
             st.success("🧠 Summary generated:")
             st.write(summary)
         else:
@@ -68,4 +52,4 @@ if uploaded_file:
     except Exception as e:
         st.error(f"⚠️ Error: {e}")
 
-st.caption("Powered by OpenRouter • Free model: Mixtral-8x7B-Instruct")
+st.caption("Powered by Hugging Face • Free model: BART-large-CNN")
