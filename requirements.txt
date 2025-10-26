@@ -1,9 +1,7 @@
 streamlit
 pdfplumber
-pypdf
-tiktoken
-openai
-tenacity
-numpy
-pandas
 PyPDF2
+openai
+requests
+pandas
+numpy
