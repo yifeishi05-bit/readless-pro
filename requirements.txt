@@ -6,3 +6,4 @@ openai
 tenacity
 numpy
 pandas
+PyPDF2
