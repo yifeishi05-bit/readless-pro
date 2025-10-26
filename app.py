@@ -18,15 +18,23 @@ if code != REAL_CODE:
     st.markdown(f"💳 [Click here to subscribe ReadLess Pro]({BUY_LINK})")
     st.stop()
 
-# --- 页面内容 ---
-st.title("📘 ReadLess Pro – AI Reading Assistant (Free Version)")
-st.subheader("Upload PDFs or text to get instant AI summaries – powered by Mixtral 8x7B")
+# --- OpenRouter 免费API配置 ---
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY") or st.secrets.get("OPENROUTER_API_KEY", "")
+
+headers = {
+    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+    "Content-Type": "application/json"
+}
+
+# --- 页面主体 ---
+st.title("📘 ReadLess Pro – AI Reading Assistant (Free OpenRouter Version)")
+st.subheader("Upload PDFs or text to get instant AI summaries for free!")
 
 uploaded_file = st.file_uploader("📄 Upload a PDF file", type="pdf")
 
 if uploaded_file:
-    text = ""
     with pdfplumber.open(uploaded_file) as pdf:
+        text = ""
         for page in pdf.pages:
             page_text = page.extract_text()
             if page_text:
@@ -34,25 +42,25 @@ if uploaded_file:
 
     st.info("✅ PDF uploaded successfully! Generating summary...")
 
+    # --- 发送请求到 OpenRouter ---
+    data = {
+        "model": "mistralai/mixtral-8x7b-instruct",  # ✅ 免费稳定模型
+        "messages": [
+            {"role": "system", "content": "You are a professional summarizer. Output in English or Chinese automatically."},
+            {"role": "user", "content": f"Summarize this document clearly and concisely:\n\n{text[:10000]}"}  # 限制长度避免超时
+        ]
+    }
+
     try:
-        headers = {
-            "Authorization": f"Bearer {st.secrets['OPENROUTER_API_KEY']}",
-            "Content-Type": "application/json",
-        }
-
-        data = {
-            "model": "mistralai/mixtral-8x7b",
-            "messages": [
-                {"role": "system", "content": "You are a professional summarizer."},
-                {"role": "user", "content": f"Summarize this text:\n\n{text[:10000]}"},
-            ],
-        }
-
-        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=data)
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=data
+        )
 
         if response.status_code == 200:
             summary = response.json()["choices"][0]["message"]["content"]
-            st.success("🧠 Summary:")
+            st.success("🧠 Summary generated:")
             st.write(summary)
         else:
             st.error(f"⚠️ Request failed ({response.status_code}): {response.text}")
@@ -60,4 +68,4 @@ if uploaded_file:
     except Exception as e:
         st.error(f"⚠️ Error: {e}")
 
-st.caption("Powered by OpenRouter • Free model: Mixtral-8x7B")
+st.caption("Powered by OpenRouter • Free model: Mixtral-8x7B-Instruct")
