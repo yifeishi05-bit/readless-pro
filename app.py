@@ -1,12 +1,12 @@
 import os
 import streamlit as st
+import pdfplumber
 from openai import OpenAI
-import PyPDF2
 
 # --- 页面配置 ---
 st.set_page_config(page_title="ReadLess Pro", page_icon="📘")
 
-# --- 访问码门禁 ---
+# --- 门禁逻辑：访问码验证 + 购买引导 ---
 REAL_CODE = os.getenv("ACCESS_CODE") or st.secrets.get("ACCESS_CODE", "")
 BUY_LINK = "https://readlesspro.lemonsqueezy.com/buy/d0a09dc2-f156-4b4b-8407-12a87943bbb6"
 
@@ -18,47 +18,46 @@ if code != REAL_CODE:
     st.markdown(f"💳 [Click here to subscribe ReadLess Pro]({BUY_LINK})")
     st.stop()
 
-# --- 初始化 OpenAI ---
-api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
-if not api_key:
-    st.error("OpenAI API key not found. Please set OPENAI_API_KEY in Secrets.")
-    st.stop()
+# --- 使用 OpenRouter 免费模型 ---
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=st.secrets["OPENROUTER_API_KEY"]
+)
 
-client = OpenAI(api_key=api_key)
+# --- 页面内容 ---
+st.title("📘 ReadLess Pro – AI Reading Assistant (Free OpenRouter Version)")
+st.subheader("Upload PDFs or text to get instant AI summaries for free!")
 
-# --- 主界面 ---
-st.title("📘 ReadLess Pro — Your AI Reading Assistant")
-st.write("Upload PDFs or paste text below to get instant AI summaries in English and Chinese.")
+uploaded_file = st.file_uploader("📄 Upload a PDF file", type="pdf")
 
-# --- 上传或输入 ---
-upload = st.file_uploader("📤 Upload a PDF file", type=["pdf"])
-text_input = st.text_area("📝 Or paste your text here:")
+if uploaded_file:
+    with pdfplumber.open(uploaded_file) as pdf:
+        text = ""
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                text += t
 
-content = ""
+    if not text.strip():
+        st.error("⚠️ Could not extract text from the PDF.")
+        st.stop()
 
-if upload is not None:
-    pdf_reader = PyPDF2.PdfReader(upload)
-    content = "".join(page.extract_text() or "" for page in pdf_reader.pages)
-elif text_input.strip():
-    content = text_input.strip()
+    st.info("✅ PDF uploaded successfully! Generating summary...")
 
-if content:
-    if st.button("✨ Summarize"):
-        with st.spinner("Generating summary using AI..."):
-            prompt = f"""Summarize the following text in English and Chinese.
+    try:
+        response = client.chat.completions.create(
+            model="mistralai/mistral-tiny",  # 永久免费模型
+            messages=[
+                {"role": "system", "content": "You are a professional summarizer. Write clear, concise summaries in English."},
+                {"role": "user", "content": f"Summarize this text clearly and concisely:\n\n{text[:8000]}"}  # 限制长度防止超限
+            ],
+        )
 
-Text:
-{content[:6000]}"""   # 截取前 6000 字符避免 token 超限
+        summary = response.choices[0].message.content
+        st.success("🧠 Summary generated:")
+        st.write(summary)
 
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a bilingual academic assistant."},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            result = response.choices[0].message.content
-            st.success("✅ Summary generated successfully!")
-            st.write(result)
-else:
-    st.info("👆 Upload a PDF or paste text to start.")
+    except Exception as e:
+        st.error(f"⚠️ Error: {e}")
+
+st.caption("Powered by OpenRouter • Model: mistralai/mistral-tiny (Free)")
