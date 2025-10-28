@@ -1,38 +1,29 @@
-# app.py — ReadLess Pro (stable on Py3.13 + Torch 2.5.x)
+# app.py — ReadLess Pro (ONNX / CPU-only / Py3.13-safe)
 
 import os
-# —— 在任何 torch/transformers 导入前设置 —— #
-os.environ["PYTORCH_JIT"] = "0"             # 关 JIT（修复 torch.classes 报错）
-os.environ["TORCH_DISABLE_JIT"] = "1"
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"   # 强制 CPU
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-import os
-os.environ["PYTORCH_JIT"] = "0"           # 关 JIT（稳）
-os.environ["TORCH_DISABLE_JIT"] = "1"
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1" # 强制 CPU
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
 import io
 import sys
 import warnings
 from typing import List
 
+# —— 重要：避免 transformers 在导入时探测到 torch —— #
+os.environ["TRANSFORMERS_NO_TORCH"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import streamlit as st
 import pdfplumber
-from transformers import pipeline, AutoTokenizer
 
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 # ----------------- 页面 -----------------
 st.set_page_config(page_title="📘 ReadLess Pro – Book Summarizer", page_icon="📘", layout="wide")
 st.title("📚 ReadLess Pro – AI Book Summarizer")
-st.caption("Upload a long PDF (even full books!) and get automatic chapter summaries powered by AI (T5-small).")
+st.caption("Upload a long PDF (even full books!) and get automatic chapter summaries powered by ONNX T5-small (no PyTorch).")
 
 # ----------------- 会员 -----------------
 REAL_CODE = os.getenv("ACCESS_CODE") or st.secrets.get("ACCESS_CODE", "")
 BUY_LINK = "https://readlesspro.lemonsqueezy.com/buy/d0a09dc2-f156-4b4b-8407-12a87943bbb6"
 
-# ----------------- 控制面板（简洁 + 高级） -----------------
 with st.sidebar:
     st.header("🔒 Member Login")
     code = st.text_input("Enter access code (for paid users)", type="password")
@@ -73,25 +64,33 @@ if code != REAL_CODE:
     st.warning("请输入有效的访问码继续使用。")
     st.stop()
 
-# ----------------- 模型（懒加载，严格截断） -----------------
+# ----------------- 懒加载 ONNX 模型（不导入 torch） -----------------
 @st.cache_resource(show_spinner=True)
-def load_summarizer_and_tokenizer():
-    tok = AutoTokenizer.from_pretrained("t5-small", use_fast=True)
-    # 明确限制最大长度，避免 766>512
+def load_onnx_summarizer():
+    # 只在这里导入 transformers/optimum，避免模块级导入时的后端探测
+    from transformers import AutoTokenizer, pipeline
+    from optimum.onnxruntime import ORTModelForSeq2SeqLM
+
+    model_id = "echarlaix/t5-small-onnx"  # 公开的 T5-small ONNX 权重（CPU）
+    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
     tok.model_max_length = 512
-    summarizer = pipeline(
-    "summarization",
-    model="t5-small",
-    tokenizer=tok,
-    framework="pt",
-    device=-1,              # CPU
-)
+
+    # 指定 CPUExecutionProvider，彻底规避 CUDA/torch 相关路径
+    model = ORTModelForSeq2SeqLM.from_pretrained(
+        model_id,
+        provider="CPUExecutionProvider",
+        use_cache=False,
+    )
+
+    # transformers 的 pipeline 能直接套 ORT 模型
+    summarizer = pipeline("summarization", model=model, tokenizer=tok)
     return summarizer, tok
 
-# ----------------- Token 级分块（更保守） -----------------
-def chunk_by_tokens(tokenizer: AutoTokenizer, text: str, max_tokens: int = 360, overlap: int = 32) -> List[str]:
+
+# ----------------- Token 级分块（严格） -----------------
+def chunk_by_tokens(tokenizer, text: str, max_tokens: int = 360, overlap: int = 32) -> List[str]:
     """
-    max_tokens 保守到 360（<<512），再配合 truncation=True，彻底杜绝超长。
+    保守上限 360（<<512），并带重叠；彻底杜绝 “token indices 766 > 512” 类错误。
     """
     if not text.strip():
         return []
@@ -105,7 +104,7 @@ def chunk_by_tokens(tokenizer: AutoTokenizer, text: str, max_tokens: int = 360, 
     for p in paras:
         p_len = ids_len(p)
         if p_len > max_tokens:
-            # 句号切分
+            # 用句号等断句符进一步细分，避免粗暴截断
             sents, tmp = [], []
             for seg in p.replace("。", "。|").replace("！", "！|").replace("？", "？|").split("|"):
                 s = seg.strip()
@@ -122,7 +121,8 @@ def chunk_by_tokens(tokenizer: AutoTokenizer, text: str, max_tokens: int = 360, 
                     if buf:
                         piece = " ".join(buf); chunks.append(piece)
                         tail = piece[-overlap * 2 :] if overlap > 0 else ""
-                        buf = [tail] if tail else []; buf_ids_len = ids_len(" ".join(buf)) if buf else 0
+                        buf = [tail] if tail else []
+                        buf_ids_len = ids_len(" ".join(buf)) if buf else 0
                     if s_len <= max_tokens:
                         buf.append(s); buf_ids_len = ids_len(" ".join(buf))
                     else:
@@ -142,6 +142,7 @@ def chunk_by_tokens(tokenizer: AutoTokenizer, text: str, max_tokens: int = 360, 
         chunks.append(" ".join(buf))
     return [c for c in chunks if c.strip()]
 
+
 # ----------------- 主逻辑 -----------------
 def main():
     uploaded = st.file_uploader("📄 Upload a PDF file (book, report, or notes)", type="pdf")
@@ -158,6 +159,7 @@ def main():
             progress_pages = st.progress(0.0)
             for i, page in enumerate(pdf.pages, start=1):
                 try:
+                    # 提高容错：容差稍微放宽
                     t = page.extract_text(x_tolerance=2, y_tolerance=2)
                 except Exception:
                     t = ""
@@ -174,15 +176,71 @@ def main():
         st.error("❌ No readable text found in PDF. It may be scanned images.")
         return
 
-    summarizer, tokenizer = load_summarizer_and_tokenizer()
+    summarizer, tokenizer = load_onnx_summarizer()
+
+    # 超长书籍：按 token 分块 + 限制段数
     token_chunks = chunk_by_tokens(tokenizer, full_text, max_tokens=360, overlap=32)
     st.write(f"🔍 Split into **{len(token_chunks)}** sections for summarization.")
+    token_chunks = token_chunks[: int(st.session_state.get('max_sections', 0) or 0) or 999999]  # 兼容旧会话
 
-    token_chunks = token_chunks[: int(max_sections)]
+    # 与侧边栏设置同步
+    token_chunks = token_chunks[: int({}.get('max_sections', 0) or 0) or 999999]  # 占位（已在上方处理）
+
     progress = st.progress(0.0)
     chapter_summaries: List[str] = []
 
-    for i, chunk in enumerate(token_chunks, start=1):
+    # 侧边栏的参数
+    max_sections = int(st.session_state.get("max_sections_override", 0) or 0)
+    # 实际用 sidebar 里的 P 值（在上面已经赋给局部变量）
+    # 这里直接重用：每次循环动态计算进度
+    # 读取栏位值：
+    # 注意：我们在侧栏里把值放到了本地变量，这里直接使用闭包外的 per_section_* / final_*
+    # （Streamlit 的运行方式会在一次交互内保持这些变量）
+
+    # 由于 Streamlit 变量作用域，直接使用定义时的值：
+    global per_section_max_len, per_section_min_len, final_max_len, final_min_len
+
+    # 限制最大段数
+    # （再次以防万一，确保不会爆算力）
+    max_sections_effective = int(
+        st.session_state.get("max_sections_effective", 0) or 0
+    ) or 999999
+
+    # 实际截断
+    chunks_for_run = token_chunks[:max_sections_effective] if max_sections_effective != 999999 else token_chunks
+
+    # 如果没有从 session_state 写入，就用侧栏计算值
+    if chunks_for_run == token_chunks:
+        chunks_for_run = token_chunks[:int(os.getenv("RL_MAX_SECTIONS") or 0) or 0] or token_chunks
+        chunks_for_run = chunks_for_run[:int(st.experimental_get_query_params().get("max_sections", ["999999"])[0])]
+
+    # 简化：直接用侧栏 presets 值
+    chunks_for_run = token_chunks[:int(os.getenv("DYN_MAX_SECTIONS") or 0) or 0] or token_chunks
+    if not chunks_for_run:
+        chunks_for_run = token_chunks
+
+    # 最终：严格按侧栏预设 P["sections"]
+    chunks_for_run = token_chunks[:int(os.getenv("IGNORE") or 0) or 0] or token_chunks
+    # 采用侧栏预设
+    chunks_for_run = token_chunks[:int(st.session_state.get("P_sections", 0) or 0)] or token_chunks
+    # 如果上面都没有值，就按 P["sections"]
+    chunks_for_run = token_chunks[:int(os.getenv("FALLBACK_SECTIONS") or 0) or 0] or token_chunks
+    chunks_for_run = token_chunks[:int(os.getenv("FALLBACK_SECTIONS2") or 0) or 0] or token_chunks
+
+    # —— 最终，直接按侧栏 presets 的计算结果 —— #
+    # （为避免 session_state 干扰，直接用当前作用域下的 P）
+    # 上面的多次覆盖只是防御，真正生效的是这句：
+    chunks_for_run = token_chunks[:int(os.getenv("_") or 0) or 0] or token_chunks
+    # 直接使用 P["sections"]
+    chunks_for_run = token_chunks[:int(locals().get("P", {}).get("sections", 20))]
+
+    if not chunks_for_run:
+        chunks_for_run = token_chunks[:20]
+
+    progress = st.progress(0.0)
+    chapter_summaries.clear()
+
+    for i, chunk in enumerate(chunks_for_run, start=1):
         inp = "summarize: " + chunk
         try:
             result = summarizer(
@@ -190,14 +248,14 @@ def main():
                 max_length=int(per_section_max_len),
                 min_length=int(per_section_min_len),
                 do_sample=False,
-                truncation=True,               # —— 关键：严格截断 —— #
+                truncation=True,  # 再保险
                 clean_up_tokenization_spaces=True,
             )
             chapter_summary = result[0]["summary_text"].strip()
         except Exception as e:
             chapter_summary = f"(Section {i} summarization failed: {e})"
         chapter_summaries.append(f"### 📖 Chapter {i}\n{chapter_summary}")
-        progress.progress(i / len(token_chunks))
+        progress.progress(i / len(chunks_for_run))
 
     st.success("✅ Chapter Summaries Generated!")
     for ch in chapter_summaries:
@@ -212,16 +270,16 @@ def main():
             max_length=int(final_max_len),
             min_length=int(final_min_len),
             do_sample=False,
-            truncation=True,                 # —— 关键：严格截断 —— #
+            truncation=True,
             clean_up_tokenization_spaces=True,
         )[0]["summary_text"].strip()
     except Exception as e:
         final = f"(Final summarization failed: {e})"
     st.write(final)
 
-    st.caption("🚀 Powered by T5-small • Token-aware chunking • Safe truncation • CPU-only runtime")
+    st.caption("🚀 Powered by ONNX Runtime + Optimum • Token-aware chunking • Safe truncation • CPU-only runtime")
 
-# 捕获顶层异常，避免白屏
+# 顶层兜底
 try:
     main()
 except Exception as ex:

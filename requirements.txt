@@ -1,7 +1,10 @@
 streamlit==1.37.1
 pdfplumber==0.11.4
+
+# 核心：不用 torch，不用 sentencepiece
 transformers==4.45.2
 tokenizers==0.20.3
-torch==2.5.1
-accelerate==0.34.2
-safetensors==0.4.5
+
+# ONNX 推理栈（CPU）
+optimum==1.21.4
+onnxruntime==1.18.0
