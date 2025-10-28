@@ -1,7 +1,15 @@
+# —— 固定 Python 3.11 可用且构建稳定的版本 —— #
 streamlit==1.33.0
 pdfplumber==0.11.4
-transformers==4.41.2
-torch==2.2.2
-sentencepiece==0.2.0
-accelerate>=0.30.0
+
+# 只装 CPU 版 PyTorch，避免拉取 GPU whl
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.1.2+cpu           # 与下面的 transformers 兼容
+
+# Transformers 版本与 torch 2.1.x 稳定配套
+transformers==4.38.2
+accelerate==0.27.2
 safetensors>=0.4.2
+
+# T5 所需
+sentencepiece==0.1.99
