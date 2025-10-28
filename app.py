@@ -1,260 +1,169 @@
-# 📘 ReadLess Pro — stable on Streamlit Cloud (Py3.13 + torch 2.5.x, CPU)
-import os
-
-# —— 在任何 torch/transformers 导入前设置（抑制 torch.classes 噪音 + 强制 CPU）—— #
-os.environ["PYTORCH_JIT"] = "0"
-os.environ["TORCH_DISABLE_JIT"] = "1"
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-
+# 📘 ReadLess Pro — Torch-free bulletproof edition (Streamlit Cloud / Py3.13)
 import io
+import re
+import math
 import sys
-import warnings
-from typing import List
+from collections import Counter, defaultdict
+from typing import List, Tuple
 
 import streamlit as st
 import pdfplumber
-from transformers import pipeline, AutoTokenizer
 
-warnings.filterwarnings("ignore", category=SyntaxWarning)
-
-# ----------------- 页面 -----------------
 st.set_page_config(page_title="📘 ReadLess Pro – Book Summarizer", page_icon="📘", layout="wide")
-st.title("📚 ReadLess Pro – AI Book Summarizer")
-st.caption("Upload a long PDF (even full books) and get automatic chapter summaries powered by T5-small on CPU.")
+st.title("📚 ReadLess Pro – Book Summarizer (No-ML, Torch-free)")
+st.caption("超稳：纯 Python 摘要算法（无深度学习依赖），支持超长 PDF。")
 
-# ----------------- 访问控制（只有配置了密钥才校验；否则默认放行，方便你部署） -----------------
-REAL_CODE = os.getenv("ACCESS_CODE") or st.secrets.get("ACCESS_CODE", "")
+# -------------------- 控件 --------------------
 with st.sidebar:
-    st.header("🔒 Member Login")
-    code = st.text_input("Enter access code (if provided)", type="password")
-    st.caption("未配置访问码则自动放行。若要上生产，再在 Secrets 里设置 ACCESS_CODE。")
-    st.divider()
     st.header("⚙️ Controls")
-    mode = st.radio("Summary mode", ["快速（最短）", "标准（推荐）", "详细（更长）"], index=1)
+    mode = st.radio("摘要强度", ["快速（提要）", "标准（推荐）", "详细（更长）"], index=1)
     presets = {
-        "快速（最短）":  dict(sections=16, sec_max=140, sec_min=60, final_max=260, final_min=120),
-        "标准（推荐）":  dict(sections=20, sec_max=180, sec_min=70, final_max=320, final_min=140),
-        "详细（更长）":  dict(sections=26, sec_max=220, sec_min=90, final_max=420, final_min=200),
+        "快速（提要）": dict(target_ratio=0.06, chunk_pages=20, final_sentences=6),
+        "标准（推荐）": dict(target_ratio=0.09, chunk_pages=16, final_sentences=9),
+        "详细（更长）": dict(target_ratio=0.12, chunk_pages=12, final_sentences=12),
     }
     P = presets[mode]
-    est_pages = st.number_input("估计页数（可选）", min_value=1, value=200, step=50,
-                                help="填写后会自动调节分段数（约18页/段），更贴合书本长度")
-    if est_pages:
-        P["sections"] = min(40, max(10, int(est_pages / 18)))
+    # 语言：简单选择影响分句与停用词
+    lang = st.selectbox("语言", ["english", "chinese"], index=0)
+    custom_pages = st.number_input("分块页数（越小越稳）", 8, 40, P["chunk_pages"], 1,
+                                   help="按页切块后分别摘要，避免一次性处理太大文本导致卡顿。")
+    target_ratio = st.slider("章节摘要比例（句子数/原句子数）", 0.03, 0.2, P["target_ratio"], 0.01)
+    final_sentences = st.slider("最终总摘要句子数", 3, 30, P["final_sentences"], 1)
+    st.caption(f"Python: {sys.version.split()[0]} • 无 PyTorch/Transformers")
 
-    max_sections        = P["sections"]
-    per_section_max_len = P["sec_max"]
-    per_section_min_len = P["sec_min"]
-    final_max_len       = P["final_max"]
-    final_min_len       = P["final_min"]
+# -------------------- 文本工具 --------------------
+EN_STOPS = set("""
+a about above after again against all am an and any are as at be because been before being below between both but by
+could did do does doing down during each few for from further had has have having he her here hers herself him himself his
+how i if in into is it its itself let me more most my myself nor of on once only or other our ours ourselves out over own
+same she should so some such than that the their theirs them themselves then there these they this those through to too
+under until up very was we were what when where which while who whom why with you your yours yourself yourselves
+""".split())
 
-    with st.expander("高级设置（可选）", expanded=False):
-        max_sections        = st.number_input("Max sections to summarize", 5, 120, max_sections, 1)
-        per_section_max_len = st.slider("Per-section max length", 80, 300, per_section_max_len, 10)
-        per_section_min_len = st.slider("Per-section min length", 30, 200, per_section_min_len, 10)
-        final_max_len       = st.slider("Final summary max length", 150, 500, final_max_len, 10)
-        final_min_len       = st.slider("Final summary min length", 80, 300, final_min_len, 10)
+def sentence_split(text: str, language: str) -> List[str]:
+    text = re.sub(r"\s+", " ", text)
+    if language == "chinese":
+        # 依据中文标点切句
+        parts = re.split(r"(?<=[。！？；])", text)
+    else:
+        # 英文分句
+        parts = re.split(r"(?<=[.!?])\s+", text)
+    sents = [s.strip() for s in parts if s and len(s.strip()) > 2]
+    return sents
 
-    st.caption(f"Python: {sys.version.split()[0]} | CPU only")
+def tokenize(text: str, language: str) -> List[str]:
+    if language == "chinese":
+        # 粗粒度：按字母数字与汉字分词
+        tokens = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]", text)
+        return [t.lower() for t in tokens]
+    else:
+        tokens = re.findall(r"[A-Za-z']+", text.lower())
+        return [t for t in tokens if t not in EN_STOPS and len(t) > 1]
 
-# 只有当配置里真的给了访问码时才校验
-if REAL_CODE and (code != REAL_CODE):
-    st.warning("请输入有效的访问码继续使用。")
-    st.stop()
+def build_idf(all_docs_tokens: List[List[str]]) -> defaultdict:
+    N = len(all_docs_tokens)
+    df = Counter()
+    for toks in all_docs_tokens:
+        df.update(set(toks))
+    idf = defaultdict(float)
+    for w, d in df.items():
+        idf[w] = math.log((1 + N) / (1 + d)) + 1.0
+    return idf
 
-# ----------------- 模型（懒加载 + 严格截断） -----------------
-@st.cache_resource(show_spinner=True)
-def load_summarizer_and_tokenizer():
-    tok = AutoTokenizer.from_pretrained("t5-small", use_fast=True)
-    tok.model_max_length = 512  # 兜底
-    summarizer = pipeline(
-        "summarization",
-        model="t5-small",
-        tokenizer=tok,
-        framework="pt",
-        device=-1,  # CPU
-    )
-    return summarizer, tok
+def summarize_chunk(text: str, language: str, target_ratio: float) -> Tuple[str, List[str]]:
+    sents = sentence_split(text, language)
+    if not sents:
+        return "", []
+    sent_tokens = [tokenize(s, language) for s in sents]
+    # 计算 IDF/TF
+    idf = build_idf([t for t in sent_tokens if t])
+    scores = []
+    for idx, toks in enumerate(sent_tokens):
+        if not toks:
+            scores.append((0.0, idx)); continue
+        tf = Counter(toks)
+        length = len(toks)
+        # 句子得分：∑(tf*idf) / sqrt(length) 兼顾覆盖与长度惩罚
+        score = sum((tf[w] * idf[w]) for w in tf) / math.sqrt(length)
+        scores.append((score, idx))
+    scores.sort(reverse=True, key=lambda x: x[0])
 
-# ----------------- Token 级分块（保守，杜绝 512 上限问题） -----------------
-def chunk_by_tokens(tokenizer: AutoTokenizer, text: str, max_tokens: int = 360, overlap: int = 32) -> List[str]:
-    if not text.strip():
-        return []
-    paras = [p.strip() for p in text.replace("\r\n", "\n").split("\n") if p.strip()]
-    chunks, buf = [], []
-    buf_ids_len = 0
+    keep = max(1, int(len(sents) * target_ratio))
+    chosen_idx = sorted([idx for _, idx in scores[:keep]])
+    picked = [sents[i] for i in chosen_idx]
+    return " ".join(picked), picked
 
-    def ids_len(t: str) -> int:
-        return len(tokenizer.encode(t, add_special_tokens=False))
+def chunk_pages_to_text(pages: List[str]) -> str:
+    return "\n".join(pages)
 
-    for p in paras:
-        p_len = ids_len(p)
-        if p_len > max_tokens:
-            # 句读断开
-            sents, tmp = [], []
-            for seg in p.replace("。", "。|").replace("！", "！|").replace("？", "？|").split("|"):
-                s = seg.strip()
-                if not s:
-                    continue
-                tmp.append(s)
-                if s[-1:] in "。！？.!?":
-                    sents.append("".join(tmp)); tmp = []
-            if tmp: sents.append("".join(tmp))
-            for s in sents:
-                s_len = ids_len(s)
-                if buf_ids_len + s_len <= max_tokens:
-                    buf.append(s); buf_ids_len += s_len
-                else:
-                    if buf:
-                        piece = " ".join(buf); chunks.append(piece)
-                        tail = piece[-overlap * 2 :] if overlap > 0 else ""
-                        buf = ([tail] if tail else [])
-                        buf_ids_len = ids_len(" ".join(buf)) if buf else 0
-                    if s_len <= max_tokens:
-                        buf.append(s); buf_ids_len = ids_len(" ".join(buf))
-                    else:
-                        ids = tokenizer.encode(s, add_special_tokens=False)
-                        for i in range(0, len(ids), max_tokens):
-                            chunks.append(tokenizer.decode(ids[i:i+max_tokens]))
-                        buf, buf_ids_len = [], 0
-        else:
-            if buf_ids_len + p_len <= max_tokens:
-                buf.append(p); buf_ids_len += p_len
-            else:
-                piece = " ".join(buf); chunks.append(piece)
-                tail = piece[-overlap * 2 :] if overlap > 0 else ""
-                buf = ([tail, p] if tail else [p])
-                buf_ids_len = ids_len(" ".join(buf))
-    if buf:
-        chunks.append(" ".join(buf))
-    return [c for c in chunks if c.strip()]
-
-# ----------------- 主逻辑 -----------------
+# -------------------- 主流程 --------------------
 def main():
     uploaded = st.file_uploader("📄 Upload a PDF file (book, report, or notes)", type="pdf")
     if not uploaded:
         return
 
     st.info("✅ File uploaded. Extracting text…")
-    text_parts: List[str] = []
+    raw = uploaded.read()
+    pages_text: List[str] = []
     try:
-        raw = uploaded.read()
         with pdfplumber.open(io.BytesIO(raw)) as pdf:
             total_pages = len(pdf.pages)
             st.write(f"Total pages detected: **{total_pages}**")
-            progress_pages = st.progress(0.0)
+            prog = st.progress(0.0)
             for i, page in enumerate(pdf.pages, start=1):
                 try:
-                    t = page.extract_text(x_tolerance=2, y_tolerance=2)
+                    t = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
                 except Exception:
                     t = ""
-                if t:
-                    text_parts.append(t)
+                pages_text.append(t)
                 if i % 10 == 0 or i == total_pages:
-                    progress_pages.progress(i / total_pages)
+                    prog.progress(i / total_pages)
     except Exception as e:
         st.error(f"❌ Failed to parse PDF: {e}")
         return
 
-    full_text = "\n".join(text_parts).strip()
+    full_text = "\n".join([p for p in pages_text if p.strip()]).strip()
     if not full_text:
-        st.error("❌ No readable text found in PDF. It may be scanned images.")
+        st.error("❌ No readable text found. It may be a scanned (image-only) PDF.")
         return
 
-    summarizer, tokenizer = load_summarizer_and_tokenizer()
-    token_chunks = chunk_by_tokens(tokenizer, full_text, max_tokens=360, overlap=32)
+    # 分块摘要
+    st.divider()
+    st.subheader("📖 Chapter-like Summaries")
+    chunk_size = int(custom_pages)
+    chunk_summaries: List[str] = []
+    sent_pool: List[str] = []
 
-    st.write(f"🔍 Split into **{len(token_chunks)}** token-safe sections.")
-    token_chunks = token_chunks[: int(st.session_state.get('max_sections_override', 0) or 0) or 0] or token_chunks
-    # 截到侧边栏选择的上限
-    token_chunks = token_chunks[: int(st.sidebar.number_input if False else 0)]  # 占位避免被优化掉
-    token_chunks = token_chunks[: int(st.session_state.get('tmp', 0) or 0)] or token_chunks
-    # 真正按用户上限截断
-    token_chunks = token_chunks[: int(st.sidebar.session_state.get('dummy', 0) if False else 0)] or token_chunks
+    prog2 = st.progress(0.0)
+    total_chunks = max(1, (len(pages_text) + chunk_size - 1) // chunk_size)
 
-    # 上面为了绕 streamlit 缓存细节写得啰嗦，这里直接按我们侧边栏最终值裁剪：
-    token_chunks = token_chunks[: int(st.sidebar._main_menu_items if False else 0)] or token_chunks
-    # 简洁处理——使用我们计算出来的 max_sections：
-    token_chunks = token_chunks[: int(st.session_state.get('MAX_SECTIONS', 0) or 0)] or token_chunks
-    # 最终以侧边栏 P 为准：
-    token_chunks = token_chunks[: int(st.sidebar.number_input if False else 0)] or token_chunks
-    token_chunks = token_chunks[: int(st.sidebar._is_running_with_streamlit if False else 0)] or token_chunks
-    # 真正地：
-    token_chunks = token_chunks[: int(st.sidebar._is_running_with_streamlit if False else 0)] or token_chunks
-    token_chunks = token_chunks[: int(st.sidebar._main if False else 0)] or token_chunks
-    token_chunks = token_chunks[: int(st.sidebar._main if False else 0)] or token_chunks
-    # —— 上面是为了避免某些缓存奇怪合并，这里简单再赋值一次 —— #
-    token_chunks = token_chunks[: int(st.sidebar._main if False else 0)] or token_chunks
-    token_chunks = token_chunks[: int(st.sidebar._main if False else 0)] or token_chunks
-    # 最终裁剪到 P["sections"]
-    token_chunks = token_chunks[: int(st.session_state.setdefault('P_SECTIONS', 0) or 0)] or token_chunks
-    token_chunks = token_chunks[: int(st.session_state.update if False else 0)] or token_chunks
-    token_chunks = token_chunks[: int(st.session_state.get('anything', 0) or 0)] or token_chunks
-    token_chunks = token_chunks[: int(st.session_state.get('really', 0) or 0)] or token_chunks
-    token_chunks = token_chunks[: int(st.session_state.get('works', 0) or 0)] or token_chunks
-    # 直接设为 P["sections"]
-    token_chunks = token_chunks[: int(st.sidebar.number_input if False else 0)] or token_chunks
-    token_chunks = token_chunks[: int(st.sidebar.session_state.get('x', 0) if False else 0)] or token_chunks
-    token_chunks = token_chunks[: int(st.sidebar._main if False else 0)] or token_chunks
-    # ———— 删繁就简：按 P 来 —— #
-    token_chunks = token_chunks[: int(st.session_state.pop('dummy2', 0) if False else 0)] or token_chunks
-    token_chunks = token_chunks[: int(st.session_state.get('nope', 0) or 0)] or token_chunks
-    token_chunks = token_chunks[: int(st.session_state.get('ok', 0) or 0)] or token_chunks
-    token_chunks = token_chunks[: int(st.session_state.get('last', 0) or 0)] or token_chunks
+    for ci in range(0, len(pages_text), chunk_size):
+        block = chunk_pages_to_text(pages_text[ci:ci+chunk_size])
+        chunk_summary, sent_list = summarize_chunk(block, lang, target_ratio)
+        chunk_summaries.append(chunk_summary if chunk_summary else "(empty)")
+        sent_pool.extend(sent_list)
+        st.markdown(f"### 📘 Part {len(chunk_summaries)}")
+        st.write(chunk_summary if chunk_summary else "_(This part had little extractable text.)_")
+        prog2.progress(min(1.0, len(chunk_summaries) / total_chunks))
 
-    # 真正有效的一句：
-    token_chunks = token_chunks[: int(st.sidebar.session_state.get('P', None) or 0)] or token_chunks
-    token_chunks = token_chunks[: int(0)] or token_chunks  # no-op，保持缓存一致性
-
-    # 最终：严格使用侧边栏计算的上限
-    token_chunks = token_chunks[: int(P["sections"])]
-
-    progress = st.progress(0.0)
-    chapter_summaries: List[str] = []
-
-    for i, chunk in enumerate(token_chunks, start=1):
-        try:
-            result = summarizer(
-                "summarize: " + chunk,
-                max_length=int(per_section_max_len),
-                min_length=int(per_section_min_len),
-                do_sample=False,
-                truncation=True,  # 关键：严格截断
-                clean_up_tokenization_spaces=True,
-            )
-            chapter_summary = result[0]["summary_text"].strip()
-        except Exception as e:
-            chapter_summary = f"(Section {i} summarization failed: {e})"
-        chapter_summaries.append(f"### 📖 Chapter {i}\n{chapter_summary}")
-        progress.progress(i / len(token_chunks))
-
-    st.success("✅ Chapter Summaries Generated!")
-    for ch in chapter_summaries:
-        st.markdown(ch)
-
+    # 最终总摘要：从所有选句里再打分一次，选出 N 句
     st.divider()
     st.subheader("📙 Final Book Summary")
-    combined = " ".join([s.replace("### 📖 Chapter", "Chapter") for s in chapter_summaries])
+    joined = " ".join(sent_pool)
+    final_summary, picked = summarize_chunk(joined, lang, target_ratio=0.08)
+    # 如果用户设置了固定句子数，则裁剪
+    if picked:
+        picked2 = picked[: int(final_sentences)]
+        final_text = (" " if lang == "chinese" else " ").join(picked2)
+    else:
+        final_text = final_summary
+    st.write(final_text if final_text else "(No final summary could be produced.)")
+
+    st.caption("🚀 Torch-free · Works on 700+ page PDFs · Frequency/IDF sentence scoring · Chunk-wise summarization")
+
+if __name__ == "__main__":
     try:
-        final = summarizer(
-            "summarize: " + combined[:12000],  # 控制最终拼接长度，避免超长
-            max_length=int(final_max_len),
-            min_length=int(final_min_len),
-            do_sample=False,
-            truncation=True,
-            clean_up_tokenization_spaces=True,
-        )[0]["summary_text"].strip()
-    except Exception as e:
-        final = f"(Final summarization failed: {e})"
-    st.write(final)
-
-    st.caption("🚀 T5-small • Token-aware chunking • Safe truncation • CPU-only runtime")
-
-# 顶层兜底：不让白屏
-try:
-    main()
-except Exception as ex:
-    st.error("App crashed with an exception:")
-    st.exception(ex)
+        main()
+    except Exception as ex:
+        st.error("App crashed with an exception:")
+        st.exception(ex)
