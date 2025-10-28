@@ -1,297 +1,218 @@
-# requirements.txt
-
-```
-streamlit==1.37.1
-pdfplumber==0.11.4
-```
-
----
-
-# app.py
-
-```python
-# 🟦 ReadLess Pro — 分层摘要稳定版（20页一级摘要 → 每20段再做二级摘要 → 最终摘要）
-# 纯Python抽取式算法，无Torch/Transformers；适配 Python 3.13 / Streamlit Cloud；
-# 专治大PDF：全量异常捕获 + 分层分块 + 字符长度上限 + 渐进式内存占用。
+# ReadLess Pro — 分层摘要（20页一段 × 二级汇总）【稳定可跑版】
+# 纯 Python / 不用 transformers / 不用 torch，适合大 PDF
 
 import io
 import re
 import time
-import traceback
+import textwrap
 from collections import Counter
-from typing import List
+from typing import List, Tuple
 
 import streamlit as st
 import pdfplumber
 
-# ================= 页面与侧边栏 =================
-st.set_page_config(page_title="📘 ReadLess Pro – Hierarchical PDF Summarizer", page_icon="📘", layout="wide")
-st.title("📚 ReadLess Pro – 分层摘要（大PDF稳如老狗）")
-st.caption("20页一段做一级摘要 → 每20段再汇总做二级摘要 → 再汇总成全书摘要。纯Python，无外部大模型依赖。")
+# ---------------- UI ----------------
+st.set_page_config(page_title="📘 ReadLess Pro — 分层摘要（稳定可跑版）", page_icon="📘", layout="wide")
+st.title("📚 ReadLess Pro — 分层摘要（稳定可跑版）")
+st.caption("上传任意大的**文本型**PDF：每20页摘要→二级汇总→最终总览（参数可调）。")
 
 with st.sidebar:
-    st.header("⚙️ 摘要参数（可调，默认已很稳）")
-    CHUNK_PAGES = st.number_input("一级分块：每段包含的页数", min_value=10, max_value=60, value=20, step=1,
-                                  help="建议 15~30，越大越稳；20 与你提出的方案一致")
-    GROUP_SUMMARIES = st.number_input("二级分块：每组包含的一级段数", min_value=5, max_value=60, value=20, step=1,
-                                      help="20 表示把 20 段一级摘要再合并做一次摘要（约 400 页/组）")
-
-    top_k_lvl1 = st.slider("一级摘要：每段保留关键句数", 2, 12, 6)
-    top_k_lvl2 = st.slider("二级摘要：每组保留关键句数", 2, 12, 8)
-    top_k_final = st.slider("最终摘要：全书保留关键句数", 4, 30, 14)
-
-    show_debug = st.checkbox("显示调试信息（字符数/句子数/用时）", value=True)
+    st.header("⚙️ 参数")
+    pages_per_chunk = st.number_input("每段包含的页数（一级）", 5, 50, 20, 1)
+    sents_per_chunk = st.number_input("每段保留句数（一级）", 3, 20, 6, 1)
+    chunks_per_super = st.number_input("多少段合并为一组（二级）", 5, 50, 20, 1)
+    sents_per_super = st.number_input("每组保留句数（二级）", 3, 30, 8, 1)
+    sents_final = st.number_input("最终总览句数", 5, 40, 14, 1)
 
     st.divider()
-    st.caption("如果仍然崩：① 把‘每段页数’调大；② 关键句数调小；③ 关闭调试输出。")
+    hard_caps = st.toggle("开启长度限幅（更稳）", value=True)
+    debug = st.toggle("显示调试信息", value=False)
 
-# ================= 摘要工具（纯Python抽取式） =================
-WHITES = re.compile(r"\s+")
-CN_PUNCS = "。！？；："
-EN_PUNCS = r"\.\!\?\;\:"
-SPLIT_REGEX = re.compile(rf"(?<=[{CN_PUNCS}])|(?<=[{EN_PUNCS}])")
-STOPWORDS = set("""
-的 了 和 与 及 或 而 被 将 把 在 之 其 这 那 本 该 并 对 于 从 中 等 比 更 很 非 非常 我们 他们 你们 因此 所以 但是 然而 以及 通过 通过
-the a an and or but so of in on at to for with from by this that these those is are was were be been being it they we you he she as if than then
-""".split())
+    st.caption("提示：扫描/图片型PDF无法直接提取文字，本工具会提示先做OCR。")
 
-# 安全上限，防极端长页面/句子/拼接导致崩溃
-MAX_CHARS_PER_PAGE = 15000
-MAX_CHARS_PER_SENT = 1000
-MAX_JOINED_LEN = 1_200_000
+uploaded = st.file_uploader("📄 上传 PDF（书籍/报告/讲义，非扫描）", type=["pdf"])
+if not uploaded:
+    st.stop()
 
+# ---------------- 工具函数 ----------------
+_CJK_RANGE = (
+    ("\u4e00", "\u9fff"),  # CJK Unified Ideographs
+    ("\u3400", "\u4dbf"),  # CJK Extension A
+)
 
-def clean_text(t: str) -> str:
-    if not t:
-        return ""
-    t = t.replace("\x00", " ").replace("\u200b", " ").replace("\ufeff", " ")
-    t = WHITES.sub(" ", t).strip()
-    if len(t) > MAX_CHARS_PER_PAGE:
-        t = t[:MAX_CHARS_PER_PAGE]
-    return t
-
+def is_cjk(ch: str) -> bool:
+    if len(ch) != 1:
+        return False
+    o = ord(ch)
+    for a, b in _CJK_RANGE:
+        if ord(a) <= o <= ord(b):
+            return True
+    return False
 
 def split_sentences(text: str) -> List[str]:
-    raw = [s.strip() for s in SPLIT_REGEX.split(text) if s and s.strip()]
-    # 合并过短片段，限制超长句
-    sents, buf = [], ""
-    for s in raw:
-        if len(s) < 8:
-            buf += s
-            continue
-        if buf:
-            s = (buf + s)[:MAX_CHARS_PER_SENT]
-            buf = ""
-        sents.append(s[:MAX_CHARS_PER_SENT])
-    if buf:
-        sents.append(buf[:MAX_CHARS_PER_SENT])
-    # 若几乎无标点 → 硬切
-    if len(sents) <= 1 and len(text) > 0:
-        sents = [text[i:i + 300] for i in range(0, len(text), 300)]
+    # 中英文通用句子切分
+    text = re.sub(r"[ \t]+", " ", text)
+    # 先处理中文标点，再处理英文
+    parts = re.split(r"(?<=[。！？…])\s*|\s*(?<=[!?])\s+", text)
+    sents = [s.strip() for s in parts if s and s.strip()]
     return sents
 
+_EN_STOP = set("""
+a an the of to in for on with at from into during including until against among throughout despite toward upon
+I you he she it we they me him her them my your his their our ours yours mine
+and or but if while though although as than so because since unless until whereas whether nor
+is am are was were be being been do does did done doing have has had having can could may might must shall should will would
+""".split())
+# 常见中文虚词/停用词（简版）
+_ZH_STOP = set(list("的了呢吧啊嘛哦呀呀着过也很都就并而及与把被对于不是没有还是"))
 
-def tokenize_mixed(sent: str) -> List[str]:
-    parts = []
-    for w in WHITES.split(sent):
-        w = w.strip().lower()
-        if not w:
-            continue
-        if re.search(r"[a-z]", w):
-            parts.append(w)
-        else:
-            for ch in w:
-                if re.match(r"[\u4e00-\u9fff]", ch):
-                    parts.append(ch)
-    return [p for p in parts if p and p not in STOPWORDS and not p.isdigit()]
+def tokenize(text: str) -> List[str]:
+    # 对中文：按单字（去停用）；对英文：\w+ 小写（去停用）
+    if any(is_cjk(c) for c in text):
+        toks = [c for c in text if is_cjk(c) and c not in _ZH_STOP]
+    else:
+        toks = [w.lower() for w in re.findall(r"[A-Za-z0-9]+", text)]
+        toks = [w for w in toks if w not in _EN_STOP and len(w) > 1]
+    return toks
 
+def summarize_extractive(text: str, keep: int, cap_chars: int = 40000) -> str:
+    """
+    纯抽取式摘要（频次 + 位置微调）
+    - cap_chars: 截断上限防爆内存/超长
+    """
+    if not text.strip():
+        return ""
 
-def score_and_pick(text: str, top_k: int) -> str:
-    text = clean_text(text)
-    if not text:
-        return "(空段)"
+    if hard_caps and len(text) > cap_chars:
+        text = text[:cap_chars]
+
     sents = split_sentences(text)
-    if len(sents) <= top_k:
-        return " ".join(sents)
+    if not sents:
+        return ""
 
-    toks_per_sent = []
+    # 统计词频
     freq = Counter()
     for s in sents:
-        toks = tokenize_mixed(s)
-        toks_per_sent.append(toks)
-        freq.update(toks)
+        for t in tokenize(s):
+            freq[t] += 1
     if not freq:
-        return " ".join(sents[:top_k])
+        # 没法统计就取开头若干句
+        return " ".join(sents[:keep])
 
     maxf = max(freq.values())
-    weights = {w: v / maxf for w, v in freq.items()}
+    for k in list(freq.keys()):
+        freq[k] = freq[k] / maxf
 
-    scores = []
+    # 句子打分：词频和 + 位置奖励（靠前略高）
+    scored: List[Tuple[int, float, str]] = []
     n = len(sents)
-    for i, toks in enumerate(toks_per_sent):
-        if not toks:
-            scores.append(0.0)
-            continue
-        base = sum(weights.get(t, 0.0) for t in toks) / len(toks)
-        # 位置微调：中间略高 + 首段稍高，避免只取开头
-        pos_boost = 1.0 + 0.15 * (1 - abs((i + 1) - (n / 2)) / (n / 2 + 1e-9))
-        scores.append(base * pos_boost)
+    for i, s in enumerate(sents):
+        tokens = tokenize(s)
+        base = sum(freq.get(t, 0) for t in tokens)
+        # 位置奖励：前 20% 稍微加分
+        pos_bonus = 0.15 if i < max(1, int(0.2 * n)) else 0.0
+        length_norm = (len(tokens) ** 0.5) or 1.0
+        score = (base / length_norm) + pos_bonus
+        scored.append((i, score, s))
 
-    idx = sorted(range(n), key=lambda i: (-scores[i], i))[:top_k]
-    idx.sort()
-    return " ".join(sents[i] for i in idx)
+    # 选 topK，但保持原顺序
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top = sorted(scored[:max(1, keep)], key=lambda x: x[0])
+    return " ".join(s for (_, _, s) in top)
 
-
-# ================= 核心流程（分层摘要） =================
-
-def summarize_pages_to_level1(page_texts: List[str], pages_per_chunk: int, top_k: int):
+def chunk_pages_text(pages: List[str], group: int) -> List[str]:
     chunks = []
-    buf, cnt = [], 0
-    for i, t in enumerate(page_texts, start=1):
-        if t:
-            buf.append(t)
-        cnt += 1
-        if cnt % pages_per_chunk == 0 or i == len(page_texts):
-            ct = "\n".join(buf).strip()
-            if ct:
-                chunks.append(ct)
-            buf, cnt = [], 0
-    summaries = []
-    prog = st.progress(0.0)
-    for idx, ch in enumerate(chunks, start=1):
-        t0 = time.time()
-        s = score_and_pick(ch, top_k=top_k)
-        summaries.append(s)
-        if show_debug:
-            st.markdown(f"### 📖 一级摘要 第 {idx} 段")
-            st.write(s)
-            st.caption(f"chunk_chars={len(ch):,} | sum_chars={len(s):,} | time={time.time()-t0:.2f}s")
-        else:
-            with st.expander(f"📖 一级摘要 第 {idx} 段", expanded=False):
-                st.write(s)
-        prog.progress(idx / len(chunks))
-    return summaries
+    for i in range(0, len(pages), group):
+        part = "\n".join(pages[i:i+group])
+        chunks.append(part)
+    return chunks
 
+def safe_extract_text(file_bytes: bytes) -> Tuple[List[str], List[int]]:
+    pages_text, empty_pages = [], []
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        total = len(pdf.pages)
+        pbar = st.progress(0.0, text="解析PDF页面中…")
+        for i, page in enumerate(pdf.pages, start=1):
+            try:
+                t = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
+            except Exception:
+                t = ""
+            if not t.strip():
+                empty_pages.append(i)
+            pages_text.append(t)
+            if i % 5 == 0 or i == total:
+                pbar.progress(i / total, text=f"解析PDF页面中…（{i}/{total}）")
+    return pages_text, empty_pages
 
-def summarize_level1_to_level2(level1_summaries: List[str], group_size: int, top_k: int):
-    groups = []
-    for i in range(0, len(level1_summaries), group_size):
-        joined = " ".join(level1_summaries[i:i + group_size])
-        if len(joined) > MAX_JOINED_LEN:
-            joined = joined[:MAX_JOINED_LEN]
-        groups.append(joined)
-
-    if not groups:
-        return []
-
-    st.divider()
-    st.subheader("📘 二级摘要（按一级摘要每组 %d 段再次归纳）" % group_size)
-    summaries = []
-    prog = st.progress(0.0)
-    for idx, g in enumerate(groups, start=1):
-        t0 = time.time()
-        s = score_and_pick(g, top_k=top_k)
-        summaries.append(s)
-        if show_debug:
-            st.markdown(f"### 🧩 二级摘要 第 {idx} 组")
-            st.write(s)
-            st.caption(f"group_chars={len(g):,} | sum_chars={len(s):,} | time={time.time()-t0:.2f}s")
-        else:
-            with st.expander(f"🧩 二级摘要 第 {idx} 组", expanded=False):
-                st.write(s)
-        prog.progress(idx / len(groups))
-    return summaries
-
-
-def render_final_summary(level2_summaries: List[str], top_k: int) -> str:
-    st.divider()
-    st.subheader("📙 全书最终摘要")
-    if not level2_summaries:
-        st.info("只有一级摘要，直接对一级摘要进行最终提炼。")
-        joined = " ".join(level2_summaries)
-    joined = " ".join(level2_summaries) if level2_summaries else ""
-    if len(joined) > MAX_JOINED_LEN:
-        joined = joined[:MAX_JOINED_LEN]
-    final = score_and_pick(joined, top_k=top_k) if joined else "(没有可供最终摘要的文本)"
-    st.write(final)
-    return final
-
-
-# ================= 主程序（全量异常捕获） =================
-
-def main():
-    uploaded = st.file_uploader("📄 上传PDF（任意大小，文本版最佳）", type="pdf")
-    if not uploaded:
-        return
-
-    st.info("✅ 文件已上传，开始逐页解析…")
-    t0 = time.time()
-
-    # 逐页提取文本（边读边清洗，限制每页长度）
-    page_texts: List[str] = []
-    try:
-        raw = uploaded.read()
-        with pdfplumber.open(io.BytesIO(raw)) as pdf:
-            total_pages = len(pdf.pages)
-            st.write(f"检测到总页数：**{total_pages}**")
-            bar = st.progress(0.0)
-            for i, page in enumerate(pdf.pages, start=1):
-                try:
-                    t = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
-                except Exception as e:
-                    t = ""
-                    if show_debug:
-                        st.write(f"⚠️ 第 {i} 页解析异常：{e}")
-                page_texts.append(clean_text(t))
-                if i % 10 == 0 or i == total_pages:
-                    bar.progress(i / total_pages)
-    except Exception as e:
-        st.error("❌ 解析PDF失败（外层打开/读取阶段）")
-        st.exception(e)
-        return
-
-    non_empty = sum(1 for t in page_texts if t)
-    if non_empty == 0:
-        st.error("❌ 没有读到可用文本：可能是扫描/图片型PDF，请先做OCR再上传。")
-        return
-
-    # 一级摘要（每 CHUNK_PAGES 页一段）
-    st.divider()
-    st.subheader("📖 一级摘要（每 %d 页一段）" % CHUNK_PAGES)
-    lvl1 = summarize_pages_to_level1(page_texts, pages_per_chunk=CHUNK_PAGES, top_k=top_k_lvl1)
-
-    # 二级摘要（每 GROUP_SUMMARIES 段一级摘要再做一次）
-    lvl2 = summarize_level1_to_level2(lvl1, group_size=GROUP_SUMMARIES, top_k=top_k_lvl2)
-
-    # 最终摘要
-    final = render_final_summary(lvl2 if lvl2 else lvl1, top_k=top_k_final)
-
-    # 下载按钮（包含一级/二级/最终摘要）
-    st.divider()
-    st.subheader("⬇️ 导出摘要")
-    export_lines = ["# 最终摘要\n", final, "\n\n## 二级摘要\n"]
-    export_lines += [f"- {s}" for s in (lvl2 if lvl2 else [])]
-    export_lines.append("\n\n## 一级摘要\n")
-    for i, s in enumerate(lvl1, start=1):
-        export_lines.append(f"### 段 {i}\n{s}\n")
-    export_text = "\n".join(export_lines)
-
-    st.download_button(
-        label="下载 Markdown 摘要",
-        data=export_text.encode("utf-8"),
-        file_name="readless_summary.md",
-        mime="text/markdown",
-    )
-
-    if show_debug:
-        st.caption(f"总用时：{time.time()-t0:.2f}s（纯CPU）")
-
-
-# 顶层全量捕获，避免‘Oh no’只给红屏
+# ---------------- 主流程 ----------------
 try:
-    main()
-except Exception as ex:
-    st.error("❌ 程序异常（已捕获），请将以下堆栈发我排查：")
-    st.exception(ex)
-    st.code(traceback.format_exc())
-```
+    raw = uploaded.read()
+except Exception as e:
+    st.error(f"读取文件失败：{e}")
+    st.stop()
+
+t0 = time.time()
+pages_text, empty_pages = safe_extract_text(raw)
+total_pages = len(pages_text)
+st.success(f"✅ 已解析页数：{total_pages} 页")
+if empty_pages:
+    st.warning(f"有 {len(empty_pages)} 页几乎没有可读文字（可能是扫描/图片页）。示例：{empty_pages[:10]}…")
+
+# 一级：每 N 页一段 → 抽取若干句
+level1_chunks = chunk_pages_text(pages_text, pages_per_chunk)
+st.write(f"🔹 一级分段数：**{len(level1_chunks)}**（每段约 {pages_per_chunk} 页）")
+
+l1_summaries: List[str] = []
+pb1 = st.progress(0.0, text="一级摘要生成中…")
+for i, chunk in enumerate(level1_chunks, start=1):
+    try:
+        summ = summarize_extractive(chunk, keep=sents_per_chunk, cap_chars=60000)
+    except Exception as e:
+        summ = f"(第 {i} 段摘要失败：{e})"
+    l1_summaries.append(summ)
+    if i % 2 == 0 or i == len(level1_chunks):
+        pb1.progress(i / len(level1_chunks), text=f"一级摘要生成中…（{i}/{len(level1_chunks)}）")
+
+st.subheader("📖 一级摘要（按段）")
+for idx, s in enumerate(l1_summaries, start=1):
+    st.markdown(f"**段 {idx}**：{s}")
+
+# 二级：每 M 段合并 → 再抽取
+l2_inputs = chunk_pages_text(l1_summaries, chunks_per_super)
+st.write(f"🔹 二级汇总组数：**{len(l2_inputs)}**（每组 {chunks_per_super} 段）")
+
+l2_summaries: List[str] = []
+pb2 = st.progress(0.0, text="二级汇总生成中…")
+for i, group_text in enumerate(l2_inputs, start=1):
+    try:
+        summ = summarize_extractive(group_text, keep=sents_per_super, cap_chars=40000)
+    except Exception as e:
+        summ = f"(第 {i} 组汇总失败：{e})"
+    l2_summaries.append(summ)
+    if i % 1 == 0 or i == len(l2_inputs):
+        pb2.progress(i / len(l2_inputs), text=f"二级汇总生成中…（{i}/{len(l2_inputs)}）")
+
+st.subheader("📚 二级汇总（按组）")
+for idx, s in enumerate(l2_summaries, start=1):
+    st.markdown(f"**组 {idx}**：{s}")
+
+# 最终总览
+st.subheader("🧭 最终总览")
+final_input = "\n".join(l2_summaries) if l2_summaries else "\n".join(l1_summaries)
+final_summary = summarize_extractive(final_input, keep=sents_final, cap_chars=50000)
+st.write(final_summary)
+
+# 导出
+st.divider()
+export_txt = []
+export_txt.append("# 最终总览\n" + textwrap.fill(final_summary, width=100))
+export_txt.append("\n# 二级汇总\n" + "\n\n".join(f"【组{i+1}】{s}" for i, s in enumerate(l2_summaries)))
+export_txt.append("\n# 一级摘要\n" + "\n\n".join(f"【段{i+1}】{s}" for i, s in enumerate(l1_summaries)))
+txt_bytes = "\n\n".join(export_txt).encode("utf-8", errors="ignore")
+st.download_button("📥 下载摘要（TXT）", data=txt_bytes, file_name="readless_summary.txt", mime="text/plain")
+
+# 调试信息
+if debug:
+    st.divider()
+    st.caption(f"⏱️ 用时：{time.time()-t0:.2f}s | 页数：{total_pages} | 一级段数：{len(level1_chunks)} | 二级组数：{len(l2_inputs)}")
+    st.caption(f"参数：pages_per_chunk={pages_per_chunk}, sents_per_chunk={sents_per_chunk}, chunks_per_super={chunks_per_super}, sents_per_super={sents_per_super}, sents_final={sents_final}")
