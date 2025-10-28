@@ -1,9 +1,5 @@
 streamlit
 pdfplumber
-PyPDF2
-openai
-requests
-pandas
-numpy
-transformers
-torch
+transformers==4.44.0
+torch==2.2.0+cpu
+sentencepiece
