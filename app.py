@@ -1,162 +1,187 @@
-# ReadLess Pro — 无模型大 PDF 稳定摘要 + 诊断版（强制 Py3.11 环境）
-import re, io, math
-from collections import Counter
-from typing import List
+# 🟦 ReadLess Pro — 大PDF稳固版（纯Python抽取式摘要）
+import io
+import re
+import sys
+from collections import Counter, defaultdict
 
 import streamlit as st
+import pdfplumber
 
-# —— 诊断区：无论如何先把页面跑起来 —— #
-st.set_page_config(page_title="📘 ReadLess Pro (Model-free, Py3.11)", page_icon="📘", layout="wide")
-st.title("📚 ReadLess Pro — 大 PDF 稳定摘要（无模型，Py3.11）")
-st.caption("纯提取式摘要；不依赖 torch/transformers。首先确认页面正常渲染，然后上传大 PDF。")
+# ============== 页面与侧边栏 ==============
+st.set_page_config(page_title="📘 ReadLess Pro – Book Summarizer", page_icon="📘", layout="wide")
+st.title("📚 ReadLess Pro – AI Book Summarizer (No-ML, Stable for Large PDFs)")
+st.caption("不依赖深度学习推理，按页分段 + 抽取式摘要，稳定处理超长PDF。")
 
-# 打印环境信息，帮助你确认 Cloud 已按 runtime.txt 起了 3.11
-import sys, platform
-st.info(f"Python: **{sys.version}**  •  Platform: **{platform.platform()}**")
+with st.sidebar:
+    st.header("⚙️ 摘要设置（适合大文件）")
+    mode = st.radio("摘要强度", ["精简", "标准（推荐）", "详细"], index=1)
+    preset = {
+        "精简": dict(pages_per_chunk=25, top_k_per_chunk=3, final_top_k=6),
+        "标准（推荐）": dict(pages_per_chunk=20, top_k_per_chunk=5, final_top_k=10),
+        "详细": dict(pages_per_chunk=12, top_k_per_chunk=8, final_top_k=16),
+    }[mode]
 
-# 尝试导入 pdfplumber，并把版本打印出来；失败会在页面显示详细异常（不白屏）
-try:
-    import pdfplumber
-    import pdfminer
-    st.success(f"pdfplumber ✅  | pdfplumber={getattr(pdfplumber,'__version__','?')}  pdfminer={getattr(pdfminer,'__version__','?')}")
-except Exception as e:
-    st.error("❌ 导入 pdfplumber 失败，请截图这段错误给我：")
-    st.exception(e)
+    # 可选：根据预估页数微调分段
+    est_pages = st.number_input("估计总页数（可选）", min_value=1, value=200, step=50,
+                                help="用于自动调节每段页数：页数越大，每段页数也相应变大以减少段数。")
+    if est_pages:
+        preset["pages_per_chunk"] = max(8, min(40, int(est_pages / 10)))
 
-# ---------------- 文本处理（提取式摘要，无模型） ----------------
-_SENT_SPLIT = re.compile(r"(?<=[。！？!?．.])\s+|(?<=[;；])\s+|(?<=[\n])")
-_WORD_SPLIT = re.compile(r"[^\w\u4e00-\u9fff]+")
+    pages_per_chunk = st.number_input("每段包含页数", min_value=5, max_value=60, value=preset["pages_per_chunk"], step=1)
+    top_k_per_chunk = st.slider("每段选取关键句数", 2, 15, preset["top_k_per_chunk"])
+    final_top_k = st.slider("全书最终摘要关键句数", 4, 30, preset["final_top_k"])
 
+    st.divider()
+    st.caption(f"Python: {sys.version.split()[0]} • 纯Python摘要（无需GPU/模型）")
+
+# ============== 文本与摘要工具（纯Python，无依赖） ==============
+CN_PUNCS = "。！？；："
+EN_PUNCS = r"\.\!\?\;\:"
+SPLIT_REGEX = re.compile(rf"(?<=[{CN_PUNCS}])|(?<=[{EN_PUNCS}])")
+WHITES = re.compile(r"\s+")
+# 迷你停用集合（中英混合）
 STOPWORDS = set("""
-的 了 和 与 及 而 且 在 为 对 以 并 将 把 被 这 那 其 之 于 从 到 等 等等
-是 就 都 又 很 及其 比 较 更 最 各 个 已 已经 如果 因为 所以 但是 然而
-我们 你们 他们 她们 它们 本 文 之一 其中 通过 进行 能够 可以
-a an the and or but if then else for to of in on with as by from into over under
-be is are was were been being this that these those it its their our your
+的 了 和 与 及 或 而 被 将 把 在 之 其 这 那 本 该 并 对 于 从 中 等 比 更 很 非 常 我们 他们 你们 以及 因此 因而 所以 但是 但是却 然而
+the a an and or but so of in on at to for with from by this that these those is are was were be been being it they we you he she as if than then
 """.split())
 
-def split_sentences(text: str) -> List[str]:
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{2,}", "\n", text)
-    parts = _SENT_SPLIT.split(text)
-    return [s.strip() for s in parts if len(s.strip()) >= 2]
+def clean_text(t: str) -> str:
+    t = t.replace("\x00", " ").replace("\u200b", " ").replace("\ufeff", " ")
+    t = WHITES.sub(" ", t)
+    return t.strip()
 
-def words_in(s: str) -> List[str]:
-    tokens = []
-    for t in _WORD_SPLIT.split(s):
-        t = t.strip().lower()
-        if not t:
+def split_sentences(text: str):
+    # 先按中英标点切，再合并太短的碎片
+    raw = [s.strip() for s in SPLIT_REGEX.split(text) if s and s.strip()]
+    sents = []
+    buf = ""
+    for s in raw:
+        if len(s) < 8:  # 避免极短碎句
+            buf += s
             continue
-        if (len(t) == 1 and not re.match(r"[\u4e00-\u9fff]", t)):
-            continue
-        if t in STOPWORDS:
-            continue
-        tokens.append(t)
-    return tokens
+        if buf:
+            s = buf + s
+            buf = ""
+        sents.append(s.strip())
+    if buf:
+        sents.append(buf.strip())
+    return sents
 
-def summarize_extractive(text: str, max_sent: int = 6) -> str:
-    sents = split_sentences(text)
-    if not sents:
-        return ""
-    docs = [words_in(s) for s in sents]
-    df = Counter()
-    for dw in docs:
-        for w in set(dw):
-            df[w] += 1
-    N = len(sents)
+def tokenize(sent: str):
+    # 简单混合：按空白切词 + 对中文进一步按字符滑动
+    parts = []
+    for w in WHITES.split(sent):
+        w = w.strip().lower()
+        if not w:
+            continue
+        # 英文词直接收
+        if re.search(r"[a-z]", w):
+            parts.append(w)
+        else:
+            # 中文：按单字（可选：双字）简化
+            for ch in w:
+                if re.match(r"[\u4e00-\u9fff]", ch):
+                    parts.append(ch)
+    return [p for p in parts if p and p not in STOPWORDS and not p.isdigit()]
+
+def score_sentences(sentences):
+    # 词频加权 + 位置轻微加权
+    freq = Counter()
+    sent_tokens = []
+    for s in sentences:
+        toks = tokenize(s)
+        sent_tokens.append(toks)
+        freq.update(toks)
+
+    if not freq:
+        return [0.0] * len(sentences)
+
+    maxf = max(freq.values()) or 1
+    weights = {w: v / maxf for w, v in freq.items()}
+
     scores = []
-    for i, dw in enumerate(docs):
-        if not dw:
-            scores.append((0.0, i)); continue
-        tf = Counter(dw)
-        score = 0.0
-        for w, c in tf.items():
-            idf = math.log(1 + N / (1 + df[w]))
-            score += (c / len(dw)) * idf
-        score = score / (1.0 + 0.15 * max(0, len(dw) - 40))
-        scores.append((score, i))
-    k = max(3, min(max_sent, max(3, int(N * 0.1))))
-    top_idx = [i for _, i in sorted(scores, key=lambda x: x[0], reverse=True)[:k]]
-    top_idx.sort()
-    return " ".join(sents[i] for i in top_idx)
+    n = len(sentences)
+    for i, toks in enumerate(sent_tokens):
+        if not toks:
+            scores.append(0.0)
+            continue
+        base = sum(weights.get(t, 0.0) for t in toks) / len(toks)
+        # 位置加权：段首段尾略高
+        pos_boost = 1.0 + 0.15 * (1 - abs((i + 1) - (n / 2)) / (n / 2 + 1e-9))
+        scores.append(base * pos_boost)
+    return scores
 
-def chunk_pages(pages_text: List[str], pages_per_chunk: int):
-    chunks = []
-    for i in range(0, len(pages_text), pages_per_chunk):
-        j = min(len(pages_text), i + pages_per_chunk)
-        t = "\n".join(pages_text[i:j]).strip()
-        if t:
-            chunks.append((i+1, j, t))
-    return chunks
+def summarize_chunk(text: str, top_k: int = 5):
+    text = clean_text(text)
+    if not text:
+        return "(空段)"
+    sents = split_sentences(text)
+    if len(sents) <= top_k:
+        return " ".join(sents)
+    scores = score_sentences(sents)
+    idx = sorted(range(len(sents)), key=lambda i: (-scores[i], i))[:top_k]
+    idx.sort()  # 保留原文顺序
+    return " ".join(sents[i] for i in idx)
 
-# ---------------- 侧边栏参数 ----------------
-with st.sidebar:
-    st.header("⚙️ 设置")
-    pages_per_chunk = st.slider("每段合并页数", 10, 50, 20, 2)
-    summary_sents = st.slider("每段摘要句数（上限）", 4, 12, 6, 1)
-    final_sents = st.slider("总摘要句数（上限）", 6, 20, 12, 1)
-    hard_cap_chars = st.number_input("单段字符硬上限", min_value=10000, value=25000, step=5000)
-
-# ---------------- 主流程（保证页面始终渲染，不用 st.stop） ----------------
-uploaded = st.file_uploader("📄 上传 PDF（支持 700+ 页）", type="pdf")
+# ============== 主流程（按页分段->分段摘要->全书摘要） ==============
+uploaded = st.file_uploader("📄 上传PDF（支持上百/上千页）", type="pdf")
 if not uploaded:
-    st.warning("未上传文件。页面正常即说明部署成功；请上传大 PDF 测试。")
-else:
-    st.info("文件已上传，开始解析页面文本…")
+    st.stop()
+
+st.info("✅ 文件已上传，开始解析文本…")
+page_texts = []
+try:
     raw = uploaded.read()
-    pages_text = []
-    try:
-        with pdfplumber.open(io.BytesIO(raw)) as pdf:
-            total = len(pdf.pages)
-            st.write(f"检测到页数：**{total}**")
-            prog = st.progress(0.0)
-            for i, page in enumerate(pdf.pages, start=1):
-                try:
-                    t = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
-                except Exception:
-                    t = ""
-                t = t.strip()
-                if t:
-                    t = re.sub(r"[ \t]+", " ", t)
-                    if len(t) > 12000:
-                        t = t[:12000]
-                    pages_text.append(t)
-                if i % 10 == 0 or i == total:
-                    prog.progress(i / total)
-    except Exception as e:
-        st.error("❌ 解析 PDF 失败（多为扫描版或损坏 PDF）。错误详情：")
-        st.exception(e)
-        pages_text = []
+    with pdfplumber.open(io.BytesIO(raw)) as pdf:
+        total_pages = len(pdf.pages)
+        st.write(f"检测到总页数：**{total_pages}**")
+        bar = st.progress(0.0)
+        for i, page in enumerate(pdf.pages, start=1):
+            try:
+                t = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
+            except Exception:
+                t = ""
+            page_texts.append(clean_text(t))
+            if i % 10 == 0 or i == total_pages:
+                bar.progress(i / total_pages)
+except Exception as e:
+    st.error(f"❌ 解析PDF失败：{e}")
+    st.stop()
 
-    if not pages_text:
-        st.error("❌ 未抽取到正文文本。若为扫描/图片版，请先 OCR 再上传。")
-    else:
-        chunks = chunk_pages(pages_text, pages_per_chunk)
-        st.write(f"🔍 按每 {pages_per_chunk} 页合并，共 **{len(chunks)}** 段。")
-        summs = []
-        prog2 = st.progress(0.0)
-        for idx, (p_from, p_to, text) in enumerate(chunks, start=1):
-            if len(text) > hard_cap_chars:
-                text = text[:hard_cap_chars]
-            s = summarize_extractive(text, max_sent=summary_sents) or "(本段内容过于稀疏，未生成摘要)"
-            summs.append(f"### 📖 第 {idx} 段（页 {p_from}–{p_to}）\n{s}")
-            prog2.progress(idx / len(chunks))
+if not any(page_texts):
+    st.error("❌ 没有读到可用文本（可能是扫描版或加密PDF）。请先做OCR或换可检索版再试。")
+    st.stop()
 
-        st.success("✅ 分段摘要完成！")
-        for s in summs:
-            st.markdown(s)
+# 分段（按页数），避免一次性拼超大文本
+chunks = []
+buf = []
+for i, t in enumerate(page_texts, start=1):
+    if t:
+        buf.append(t)
+    if (i % pages_per_chunk == 0) or (i == len(page_texts)):
+        chunk_text = "\n".join(buf).strip()
+        if chunk_text:
+            chunks.append(chunk_text)
+        buf = []
 
-        st.divider()
-        st.subheader("📙 全书摘要（提取式）")
-        joined = " ".join(s.replace("### ", "").replace("\n", " ") for s in summs)
-        final_sum = summarize_extractive(joined, max_sent=final_sents) or "(总摘要生成失败——原文可能过短)"
-        st.write(final_sum)
+st.write(f"🔍 已按每 {pages_per_chunk} 页分成 **{len(chunks)}** 段进行摘要。")
+st.divider()
 
-        st.download_button(
-            label="⬇️ 下载摘要 Markdown",
-            data=("\n\n".join(summs) + "\n\n---\n\n## 全书摘要\n" + final_sum).encode("utf-8"),
-            file_name="summary.md",
-            mime="text/markdown"
-        )
+# 分段摘要
+section_summaries = []
+prog = st.progress(0.0)
+for idx, ch in enumerate(chunks, start=1):
+    summary = summarize_chunk(ch, top_k=top_k_per_chunk)
+    section_summaries.append(summary)
+    st.markdown(f"### 📖 第 {idx} 段")
+    st.write(summary)
+    prog.progress(idx / len(chunks))
 
-st.caption("🚀 模型自由 · 长文稳定 · 进度可视 · 若仍失败，页面会显示详细异常（截图给我）")
+# 全书摘要（对分段摘要再做一次抽取）
+st.divider()
+st.subheader("📙 全书最终摘要")
+joined = " ".join(section_summaries)
+final_summary = summarize_chunk(joined, top_k=final_top_k)
+st.write(final_summary)
+
+st.caption("✅ 纯Python抽取式摘要：不依赖Torch/Transformers，适合大体量PDF；若需神经网络精炼，可后续再接入轻量模型。")
