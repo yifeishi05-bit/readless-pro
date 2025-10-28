@@ -6,6 +6,11 @@ os.environ["PYTORCH_JIT"] = "0"             # 关 JIT（修复 torch.classes 报
 os.environ["TORCH_DISABLE_JIT"] = "1"
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"   # 强制 CPU
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import os
+os.environ["PYTORCH_JIT"] = "0"           # 关 JIT（稳）
+os.environ["TORCH_DISABLE_JIT"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1" # 强制 CPU
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import io
 import sys
@@ -75,12 +80,12 @@ def load_summarizer_and_tokenizer():
     # 明确限制最大长度，避免 766>512
     tok.model_max_length = 512
     summarizer = pipeline(
-        "summarization",
-        model="t5-small",
-        tokenizer=tok,
-        framework="pt",
-        device=-1,                # CPU，稳定
-    )
+    "summarization",
+    model="t5-small",
+    tokenizer=tok,
+    framework="pt",
+    device=-1,              # CPU
+)
     return summarizer, tok
 
 # ----------------- Token 级分块（更保守） -----------------
