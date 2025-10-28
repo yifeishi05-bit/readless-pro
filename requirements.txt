@@ -1,5 +1,5 @@
 streamlit
 pdfplumber
-transformers==4.44.0
-torch==2.2.0+cpu
+transformers==4.36.2
+torch==2.1.0
 sentencepiece
